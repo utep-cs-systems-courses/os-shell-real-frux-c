@@ -144,17 +144,16 @@ def handle_pipe(exec1, exec2):
 
 def run_command(command):
     executables, operators = get_executables_and_operators(command)
+    # If no operators, just run the command
     if len(operators) == 0:
         pid = os.fork()
         if pid == 0:
-            print("exec", executables[0].split(" ", 1)[0])
-            # os.execve(find_exec_path(executables[0].split(" ", 1)[0]), [executables[0]], os.environ)
             os.execv(find_exec_path(executables[0].split(" ", 1)[0]), executables[0].split(" "))
         else:
             os.waitid(os.P_PID, pid, os.WEXITED)
             return
-    prev_stdin = sys.stdin.fileno()
-    prev_stdout = sys.stdout.fileno()
+    
+    # Handle operators (left to right)
     for i, operator in enumerate(operators):
         if operator == '|':
             pid = os.fork()
@@ -166,10 +165,6 @@ def run_command(command):
             handle_input_redirect(executables[i], executables[i+1])
         elif operator == '>':
             handle_output_redirect(executables[i], executables[i+1])
-    sys.stdin.flush()
-    sys.stdout.flush()
-    os.dup2(prev_stdin, sys.stdin.fileno())
-    os.dup2(prev_stdout, sys.stdout.fileno())
 
 def main():
     # Main shell loop
