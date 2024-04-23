@@ -1,6 +1,6 @@
+import re
 import os
 import sys
-import re
 
 # Function to print prompt string
 def print_prompt():
@@ -8,8 +8,7 @@ def print_prompt():
     sys.stdout.write(prompt)
     sys.stdout.flush()
 
-# Function to search for command in PATH
-def find_command(command):
+def find_exec_path(command):
     paths = os.getenv('PATH').split(':')
     for path in paths:
         cmd_path = os.path.join(path, command)
@@ -17,104 +16,170 @@ def find_command(command):
             return cmd_path
     return None
 
-# Function to execute a command
-def execute_command(command):
-    # Check for input/output redirection
-    input_file = None
-    output_file = None
-    
-    if '<' in command:
-        command, input_file = re.split('<',command, 1)
-        input_file = input_file.strip()
-    
-    if '>' in command:
-        command, output_file = re.split('>',command, 1)
-        output_file = output_file.strip()
-    
-    # Split the command by pipes
-    commands = re.split(r'\|',command)
-    num_commands = len(commands)
-    
-    # Create pipes
-    pipes = [os.pipe() for _ in range(num_commands - 1)]
-    
-    # Fork processes for each command
-    for i, cmd in enumerate(commands):
-        # Remove leading/trailing whitespaces
-        cmd = cmd.strip()
-        
-        # Create a child process
-        pid = os.fork()
-        
-        if pid == 0:  # Child process
-            # Connect pipes (except for the last command)
-            if i < num_commands - 1:
-                os.dup2(pipes[i][1], sys.stdout.fileno())  # Connect stdout to the write end of the pipe
-            
-            # Input redirection
-            if input_file and i == 0:
-                sys.stdin.close()
-                sys.stdin = os.open(input_file, os.O_RDONLY)
-            
-            # Output redirection
-            if output_file and i == num_commands - 1:
-                sys.stdout.close()
-                sys.stdout = os.open(output_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-            
-            # Close unused pipe ends
-            for p in pipes:
-                os.close(p[0])
-                os.close(p[1])
-            
-            # Split command and arguments
-            args = cmd.split()
-            command_path = args[0]
-            
-            # Check if command path is specified
-            if os.path.isfile(command_path) and os.access(command_path, os.X_OK):
-                # Execute the command
-                try:
-                    os.execve(command_path, args, os.environ)
-                except FileNotFoundError:
-                    print(f"{command_path}: command not found", file=sys.stderr)
-                    sys.exit(1)
-            else:
-                # Search for command in PATH
-                cmd_path = find_command(command_path)
-                if cmd_path:
-                    # Execute the command
-                    try:
-                        os.execve(cmd_path, args, os.environ)
-                    except FileNotFoundError:
-                        print(f"{command_path}: command not found", file=sys.stderr)
-                        sys.exit(1)
-                else:
-                    print(f"{command_path}: command not found", file=sys.stderr)
-                    sys.exit(1)
-        
-        elif pid > 0:  # Parent process
-            # Connect pipes (except for the first command)
-            if i > 0:
-                os.dup2(pipes[i-1][0], sys.stdin.fileno())  # Connect stdin to the read end of the pipe
-        
-        else:  # Error
-            sys.stderr.write("Error forking process\n")
-            sys.exit(1)
-    
-    # Close all pipe ends in the parent process
-    for p in pipes:
-        os.close(p[0])
-        os.close(p[1])
-    
-    # Wait for all child processes to finish
-    for _ in range(num_commands):
-        os.waitid(os.P_ALL, 0, os.WEXITED)
+def get_executables_and_operators(command):
+    pattern = re.compile(r'\||<|>', re.IGNORECASE)
+    operators = pattern.findall(command)
+    execs = list(map(str.strip,pattern.split(command)))
+    return execs, operators
 
-# Main shell loop
-while True:
-    print_prompt()
-    user_input = sys.stdin.readline().rstrip('\n')  # Read user input
-    # Parse input
-    if user_input == 'exit':
-        break
-    execute_command(user_input)
+def handle_input_redirect(cmd, filename):
+    if not os.path.isfile(filename):
+        sys.stderr.write(f'Error: File not found: {filename}\n')
+        return
+    fd = os.open(filename, os.O_RDONLY)
+    read_pipe, write_pipe = os.pipe()
+
+    # fork
+    pid = os.fork()
+
+    if pid == 0: # child
+        # close write pipe
+        os.close(write_pipe)
+        
+        # duplicate read pipe to stdin
+        os.dup2(read_pipe, sys.stdin.fileno())
+
+        # close original read pipe
+        os.close(read_pipe)
+
+        # execute command
+        exc, *args = cmd.split(" ")
+        path = find_exec_path(exc)
+        os.execve(path, [path] + args, os.environ)
+    
+    else: # parent
+        # close read pipe
+        os.close(read_pipe)
+
+        # read from file and write to pipe
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            os.write(write_pipe, chunk)
+
+        # close file descriptor
+        os.close(fd)
+        os.close(write_pipe)
+
+        # wait for child process to finish
+        os.waitid(os.P_PID, pid, os.WEXITED)
+
+
+def handle_output_redirect(cmd, filename):
+    fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    read_pipe, write_pipe = os.pipe()
+
+    # fork
+    pid = os.fork()
+
+    if pid == 0: # child
+        # close read pipe
+        os.close(read_pipe)
+
+        # duplicate write pipe to stdout
+        os.dup2(write_pipe, sys.stdout.fileno())
+
+        # close original write pipe
+        os.close(write_pipe)
+
+        # execute command
+        exc, *args = cmd.split(" ")
+        path = find_exec_path(exc)
+        os.execve(path, [path] + args, os.environ)
+    
+    else: # parent
+        # close write pipe
+        os.close(write_pipe)
+
+        # read from pipe and write to file
+        while True:
+            chunk = os.read(read_pipe, 4096)
+            if not chunk:
+                break
+            os.write(fd, chunk)
+
+        # close file descriptor
+        os.close(fd)
+        os.close(read_pipe)
+
+        # wait for child process to finish
+        os.waitid(os.P_PID, pid, os.WEXITED)
+
+def handle_pipe(exec1, exec2):
+    read_pipe, write_pipe = os.pipe()
+
+    # fork
+    pid = os.fork()
+
+    if pid == 0: # child
+        # close write pipe
+        os.close(write_pipe)
+
+        # duplicate read pipe to stdin
+        os.dup2(read_pipe, sys.stdin.fileno())
+
+        # close original read pipe
+        os.close(read_pipe)
+
+        # execute command
+        exc, *args = exec2.split(" ")
+        path = find_exec_path(exc)
+        os.execve(path, [path] + args, os.environ)
+    
+    else: # parent
+        # close read pipe
+        os.close(read_pipe)
+
+        # duplicate write pipe to stdout
+        os.dup2(write_pipe, sys.stdout.fileno())
+
+        # close original write pipe
+        os.close(write_pipe)
+
+        # execute command
+        exc, *args = exec1.split(" ")
+        path = find_exec_path(exc)
+        os.execve(path, [path] + args, os.environ)
+
+def run_command(command):
+    executables, operators = get_executables_and_operators(command)
+    if len(operators) == 0:
+        pid = os.fork()
+        if pid == 0:
+            print("exec", executables[0].split(" ", 1)[0])
+            # os.execve(find_exec_path(executables[0].split(" ", 1)[0]), [executables[0]], os.environ)
+            os.execv(find_exec_path(executables[0].split(" ", 1)[0]), executables[0].split(" "))
+        else:
+            os.waitid(os.P_PID, pid, os.WEXITED)
+            return
+    prev_stdin = sys.stdin.fileno()
+    prev_stdout = sys.stdout.fileno()
+    for i, operator in enumerate(operators):
+        if operator == '|':
+            pid = os.fork()
+            if pid == 0:
+                handle_pipe(executables[i], executables[i+1])
+            else:
+                os.waitid(os.P_PID, pid, os.WEXITED)
+        elif operator == '<':
+            handle_input_redirect(executables[i], executables[i+1])
+        elif operator == '>':
+            handle_output_redirect(executables[i], executables[i+1])
+    sys.stdin.flush()
+    sys.stdout.flush()
+    os.dup2(prev_stdin, sys.stdin.fileno())
+    os.dup2(prev_stdout, sys.stdout.fileno())
+
+def main():
+    # Main shell loop
+    while True:
+        print_prompt()
+        user_input = sys.stdin.readline().rstrip('\n')  # Read user input
+        # Parse input
+        if user_input == 'exit':
+            break
+        run_command(user_input)
+
+if __name__ == '__main__':
+    main()
